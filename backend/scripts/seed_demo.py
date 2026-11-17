@@ -11,6 +11,9 @@ from src.utils.security import hash_password
 from src.utils.serialization import now
 from src.services.runs import queue
 from src.services.domain_validation import validate_record
+from src.services import fragments as fragment_svc
+from src.services import rebuild as rebuild_svc
+from src.models.session_head import SessionHead
 
 def seed_values(kind,index,batch,rng):
     if kind=='gaussian':
@@ -32,6 +35,31 @@ def seed_values(kind,index,batch,rng):
 
 def counts(db):
     return {cls.__tablename__:db.scalar(select(func.count()).select_from(cls)) for cls in (User,Source,Record,Run)}
+
+def seed_fragments(db,source):
+    """片段化演示：乱序补传、缺口、撤回与完整发布；幂等，重复执行不重复计数。"""
+    marker='SEED-F-001'
+    if db.scalar(select(SessionHead).where(SessionHead.source_id==source.id,SessionHead.session_key==marker)):
+        return
+    actor='worker'
+    # 完整会话：乱序（先中间位置，再首尾），同修订多位置
+    fragment_svc.ingest(db,actor,source.id,{'session':marker,'idempotency_key':'seed-f-001',
+        'operations':[{'position':1,'revision':1,'chapter':'材料'},{'position':2,'revision':1,'chapter':'工艺'}]})
+    fragment_svc.ingest(db,actor,source.id,{'session':marker,'idempotency_key':'seed-f-002',
+        'operations':[{'position':0,'revision':2,'chapter':'序章'},{'position':3,'revision':2,'chapter':'案例'}]})
+    # 带缺口会话：缺位置2，演示缺口两侧不连边（保持草稿，不发布）
+    fragment_svc.ingest(db,actor,source.id,{'session':'SEED-F-GAP','idempotency_key':'seed-gap',
+        'operations':[{'position':0,'revision':1,'chapter':'序章'},{'position':1,'revision':1,'chapter':'材料'},
+                      {'position':3,'revision':1,'chapter':'附录'}]})
+    # 撤回示例：先补位置2再撤回，最终该会话仍缺该位置
+    fragment_svc.ingest(db,actor,source.id,{'session':'SEED-F-TOMB','idempotency_key':'seed-tomb-1',
+        'operations':[{'position':0,'revision':1,'chapter':'序章'},{'position':1,'revision':1,'chapter':'材料'},
+                      {'position':2,'revision':1,'chapter':'工艺'}]})
+    fragment_svc.ingest(db,actor,source.id,{'session':'SEED-F-TOMB','idempotency_key':'seed-tomb-2',
+        'operations':[{'position':2,'revision':2,'tombstone':True}]})
+    rebuild_svc.process_outbox(db)
+    # 仅发布完整会话（无缺口）；GAP 与 TOMB 保留草稿，不进入研究
+    fragment_svc.publish(db,actor,source.id,marker)
 def seed():
     Base.metadata.create_all(engine);rng=random.Random(42);queued=[]
     with Session() as db:
@@ -49,6 +77,8 @@ def seed():
                 if not db.scalar(select(Record.id).where(Record.source_id==source.id,Record.reference==reference)):
                     db.add(Record(source_id=source.id,reference=reference,values=validate_record(vals)))
             db.flush()
+            if batch==0:
+                seed_fragments(db,source)
             if batch==0 and not db.scalar(select(Run.id).where(Run.name=='首轮种子研究')):
                 records=[{'id':r.id,'source_id':r.source_id,'reference':r.reference,'values':r.values} for r in db.scalars(select(Record).where(Record.source_id==source.id).order_by(Record.id))]
                 run=Run(source_id=source.id,name='首轮种子研究',state='queued',parameters=CONFIG['default_parameters'],snapshot={'source':{'id':source.id,'name':source.name,'filename':source.filename},'records':records},created_at=now());db.add(run);db.flush();queued.append(run.id)

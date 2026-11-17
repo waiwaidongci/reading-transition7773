@@ -10,10 +10,11 @@
 
 1. 业务总览：批次、样本、任务与批准交付账册。
 2. 阅读文集：创建/修改来源说明、查看样本、用真实业务字段追加记录；列表分页。
-3. 分析配置：冻结来源、参数和全部样本，进入Redis队列。
-4. 完整结果：真实算法摘要、专属诊断、全部CSV导出和可恢复失败态。
-5. 编辑衔接建议：分析师草案→负责人批准→阅读者下载批准快照。
-6. 审计：登录、来源修改、任务worker完成、业务说明批准等事件。
+3. 片段接续：日志分段、乱序补传与撤回。片段带位置 `position` 与修订号 `revision`，按最新有效修订重建会话。
+4. 分析配置：冻结来源、参数和全部样本，进入Redis队列。
+5. 完整结果：真实算法摘要、专属诊断、全部CSV导出和可恢复失败态。
+6. 编辑衔接建议：分析师草案→负责人批准→阅读者下载批准快照。
+7. 审计：登录、来源修改、片段接收、会话发布、任务worker完成、业务说明批准等事件。
 
 ## 快速启动
 
@@ -66,9 +67,30 @@ ReadingCollection / ReadingSession / TransitionRun / EditorialPlan 是核心实�
 
 只统计同一会话内的相邻章节；提升度相对于所有接续边的目标章节基率，关联不代表编辑调整造成的因果效果。
 
+## 片段接收、撤回与会话重建
+
+阅读日志会把同一会话切成多个片段、乱序补传，旧的整行口径会漏掉片段接缝。系统在整行数据之外新增片段管线（旧整行数据与已批准建议原样保留、仍可读取）。
+
+- **片段与修订**：每个片段带 `position`（从 0 开始的位置）与 `revision`（修订号，≥1）。`(source, session, position, revision)` 唯一；同一位置同一修订提交不同内容按 409 拒收（同版本异值拒收），同值重试幂等不重复计数。带 `idempotency_key` 的请求重试直接返回首次结果。
+- **撤回**：`tombstone=true` 使该位置自该修订起失效（墓碑），可用于撤回错传片段；更高修订覆盖同位置旧值。
+- **有效视图与接缝**：每个位置只取“最新且存活”的修订；仅当位置 `pos` 与 `pos+1` 都有效时才连一条相邻边，**缺口两侧不连边**。页面可查每个会话的片段流水、连续段、位置缺口、物化边及其依据修订。
+- **重建与全局基率**：片段接收与重建任务在同一事务写入 `rebuild_outbox`（事务发件箱），独立 worker 处理后才删条，接收/计数/发布间崩溃可恢复重投。补片或撤回只删除并重建**受影响会话**的边（单会话增量，约毫秒级），十万会话不做全量重算；全局边计数与基率由已发布边表 SQL 聚合，随边替换增量更新。发件箱带水位守卫，旧计算晚到时抬升到最新水位再重建，绝不混用旧视图。
+- **发布与冻结**：会话分 `draft/published`。研究只冻结**完整（无位置缺口）且已发布**的会话；冻结时把重建路径与当时的全局基率写入任务快照，**排队后的补传/撤回不改变原结果**。草稿与带缺口会话不进入任何研究计数。
+- **数据落点**：`session_fragments`（片段+墓碑）、`reading_session_heads`（会话头/发布态/水位与冗余结构计数）、`session_edges`（按会话物化的连续边）、`rebuild_outbox`（发件箱）、`idempotency_ledger`（幂等键）。
+
+### 片段接口
+
+| 方法与路径 | 说明 |
+|---|---|
+| `POST /sources/{id}/fragments` | 批量接收片段操作（含 tombstone 撤回、可选 idempotency_key），写入重建发件箱 |
+| `GET /sources/{id}/sessions` | 会话列表（水位、发布态、连续段数、缺口数、边数，免逐会话扫描） |
+| `GET /sources/{id}/sessions/{session}` | 单会话片段流水、连续段、缺口、物化边与计数依据 |
+| `POST /sources/{id}/sessions/publish` | 发布当前有效视图（要求重建已追平水位） |
+| `GET /sources/{id}/base-rates` | 已发布边表的全局到达计数与目标章节基率 |
+
 失败态：业务字段缺失/非有限数值、参数越界、样本不足、退化特征或结构错误均明确拒绝或将任务标failed，错误消息保存在任务中。可回到来源或配置修正后重新执行，历史失败记录保留。
 
-已知边界：仅统计每行完整匿名会话内的相邻章节，拒绝会话编号重复；不是长序列规则挖掘。无跨会话拼接；提升度只是接续关联，不解释为因果。单章会话有效但不产生边。
+已知边界：整行口径仅统计每行完整匿名会话内的相邻章节，拒绝会话编号重复；片段口径按位置与修订重建，仅位置连续的相邻章节连边，缺口两侧不连、不跨会话拼接；不是长序列规则挖掘。提升度只是接续关联，不解释为因果。单章会话有效但不产生边。研究只冻结完整已发布会话与旧整行数据，草稿/缺口会话与排队后的补传都不改变已冻结结果。
 
 ## 演示数据与一天剧本
 
@@ -91,6 +113,8 @@ backend/src/routes, controllers, services, models, schemas, middlewares, utils, 
 backend/scripts/seed_demo.py
 backend/migrations/001_initial.sql
 ```
+
+片段管线贯穿 `models/{fragment,session_head,session_edge,rebuild}.py`、`services/{fragments,rebuild,idempotency}.py`、`schemas/fragment.py`、`controllers/fragments.py`、`routes/fragments.py` 与 `frontend/src/pages/fragments.js`；worker 在每轮分析任务前先排空重建发件箱。
 
 本地后端：Python3.11虚拟环境安装 `backend/requirements.txt`，设置 `DATABASE_URL`、`REDIS_URL`、`ARTIFACT_DIR`，在backend目录运行 `uvicorn src.main:app --reload`；另开终端运行 `python -m src.worker`。原生前端无需编译，推荐以Compose Nginx访问，保证 `/api/` 代理。前端为Google Fonts双字体、oklch色板，离线字体回退serif；1280/768/390响应布局。
 

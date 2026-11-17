@@ -1,3 +1,13 @@
--- SQLAlchemy metadata initializes tables idempotently.
+-- SQLAlchemy metadata initializes tables idempotently (Base.metadata.create_all).
 -- Domain tables: reading_collections, reading_sessions, transition_runs, editorial_plans.
 -- Unique natural keys: source.key; (record.source_id, record.reference).
+--
+-- Fragment pipeline (segmented / out-of-order log delivery):
+--   session_fragments      片段流水，唯一键 (source_id, session_key, position, revision)；
+--                          alive=0 为撤回墓碑；同版本异值在应用层拒收。
+--   reading_session_heads  会话头：head_revision 水位、state(draft/published)、
+--                          published_revision/published_path、rebuilt_revision 与冗余结构计数。
+--   session_edges          按会话物化的连续相邻边，唯一键 (head_id, position)；
+--                          仅位置 pos 与 pos+1 均有效时连边，缺口两侧不连。
+--   rebuild_outbox         事务性发件箱：与片段同事务提交，worker 处理后删除，崩溃可重投。
+--   idempotency_ledger     客户端幂等键：同键重试返回首次响应，不重复计数。
